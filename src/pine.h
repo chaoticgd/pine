@@ -390,8 +390,9 @@ class Shared {
             ToArray(ipc_buffer, 4 + 2, 0);
             ipc_buffer[4] = Y;
             ipc_buffer[5] = slot;
+            const int reply_size = 4 + 1;
             SendCommand(IPCBuffer{ 4 + 1 + 1, ipc_buffer },
-                        IPCBuffer{ 4 + 1, ret_buffer });
+                        IPCBuffer{ reply_size, ret_buffer }, reply_size);
             return;
         }
     }
@@ -434,7 +435,8 @@ class Shared {
             ToArray(ipc_buffer, 4 + 1, 0);
             ipc_buffer[4] = Y;
             SendCommand(IPCBuffer{ 4 + 1, ipc_buffer },
-                        IPCBuffer{ MAX_IPC_RETURN_SIZE, ret_buffer });
+                        IPCBuffer{ MAX_IPC_RETURN_SIZE, ret_buffer },
+                        4 + 1 + 4);
             return GetReply<Y>(ret_buffer, 5);
         }
     }
@@ -463,16 +465,19 @@ class Shared {
         unsigned int *return_locations; /**< Location of arguments in IPC return
                                            fields. */
         unsigned int msg_size;          /**< Number of IPC messages. */
+        unsigned int expected_reply_size; /***< Expected reply size, excluding
+                                             VLE response bodies. */
         bool reloc; /**< Whether the message needs relocation. */
 
         BatchCommand()
             : ipc_message{}, ipc_return{}, return_locations(nullptr),
-              msg_size(0), reloc(false) {}
+              msg_size(0), expected_reply_size(0), reloc(false) {}
 
         BatchCommand(IPCBuffer message, IPCBuffer ret, unsigned int *locations,
-                     unsigned int size, bool r)
+                     unsigned int size, unsigned int reply_length, bool r)
             : ipc_message(message), ipc_return(ret),
-              return_locations(locations), msg_size(size), reloc(r) {}
+              return_locations(locations), msg_size(size),
+              expected_reply_size(reply_length), reloc(r) {}
 
         BatchCommand(const BatchCommand &rhs) = delete;
         BatchCommand &operator=(const BatchCommand &rhs) = delete;
@@ -492,6 +497,7 @@ class Shared {
             ipc_return = rhs.ipc_return;
             return_locations = rhs.return_locations;
             msg_size = rhs.msg_size;
+            expected_reply_size = rhs.expected_reply_size;
             reloc = rhs.reloc;
 
             rhs.ipc_message = IPCBuffer{};
@@ -619,11 +625,14 @@ class Shared {
             return FromArray<uint64_t>(buf, loc);
         else if constexpr (T == MsgStatus)
             return FromArray<EmuStatus>(buf, loc);
-        else if constexpr (T == MsgVersion || T == MsgID || T == MsgTitle ||
-                           T == MsgUUID || T == MsgGameVersion) {
+        else if constexpr (IsCommandVariableLength(T)) {
+            // For strings, the server is supposed to send its own null
+            // terminator included in the size, however we have to add our own
+            // one here in case we get a malformed reply back.
             uint32_t size = FromArray<uint32_t>(buf, loc);
-            char *datastream = new char[size];
+            char *datastream = new char[size + 1];
             memcpy(datastream, &buf[loc + 4], size);
+            datastream[size] = '\0';
             return datastream;
         } else {
             SetError(Unimplemented);
@@ -632,23 +641,39 @@ class Shared {
     }
 
     /**
+     * Determines if commands of the given type have variable-length replies.
+     * @param command The command tag to test.
+     */
+    static constexpr auto IsCommandVariableLength(IPCCommand command) -> bool {
+        return command == MsgVersion || command == MsgID ||
+               command == MsgTitle || command == MsgUUID ||
+               command == MsgGameVersion;
+    }
+
+    /**
      * Sends an IPC command to the emulator. @n
-     * Fails if the IPC cannot be sent or if the emulator returns IPC_FAIL.
-     * Throws an IPCStatus on failure.
+     * This function can only be called once for a given batch command, even if
+     * an error is thrown. Fails if the IPC cannot be sent or if the emulator
+     * returns IPC_FAIL. Throws an IPCStatus on failure.
      * @param cmd An IPCBuffer containing the IPC command size and buffer OR a
      * BatchCommand.
-     * @param rt An IPCBuffer containing the IPC return size and buffer.
+     * @param rt An IPCBuffer containing the IPC return size and buffer. Ignored
+     * for batch commands.
+     * @param reply_size The expected reply length, exluding VLE reply bodies.
+     * Ignored for batch commands.
      * @see IPCResult
      * @see IPCBuffer
      */
     template <typename T>
-    auto SendCommand(const T &cmd, const T &rt = T()) -> void {
+    auto SendCommand(const T &cmd, const T &rt = T(), int64_t reply_size = 0)
+        -> void {
         IPCBuffer command;
         IPCBuffer ret;
 
         if constexpr (std::is_same<T, BatchCommand>::value) {
             command = cmd.ipc_message;
             ret = cmd.ipc_return;
+            reply_size = cmd.expected_reply_size;
         } else {
             command = cmd;
             ret = rt;
@@ -703,7 +728,7 @@ class Shared {
         printf("reply received:\n");
         hexdump(ret.buffer, receive_length);
 #endif
-        if (receive_length == 0) {
+        if (receive_length < 5) {
             SetError(Fail);
             return;
         }
@@ -722,19 +747,43 @@ class Shared {
         // update.
         // why not just assume a standard size instead of going through the pain
         // of relocating everything in the protocol? math is cheap, io isn't.
+        //
+        // In addition, we need to do bounds checking for variable-length
+        // replies here, since if we do it in GetReply it would be possible to
+        // have a bad string relocate a future response out of bounds.
+        int64_t reloc_add = 0;
         if constexpr (std::is_same<T, BatchCommand>::value) {
             if (cmd.reloc) {
-                unsigned int reloc_add = 0;
                 for (unsigned int i = 0; i < cmd.msg_size; i++) {
-                    cmd.return_locations[i] += reloc_add;
+                    cmd.return_locations[i] +=
+                        static_cast<unsigned int>(reloc_add);
                     if ((cmd.return_locations[i] & 0x80000000) != 0) {
                         cmd.return_locations[i] =
                             (cmd.return_locations[i] & ~0x80000000);
+                        if (static_cast<int64_t>(cmd.return_locations[i]) + 4 >
+                            ret.size) {
+                            SetError(Fail);
+                            return;
+                        }
                         reloc_add += FromArray<uint32_t>(
-                            ret.buffer, (cmd.return_locations[i]));
+                            ret.buffer, cmd.return_locations[i]);
                     }
                 }
             }
+        } else {
+            if (IsCommandVariableLength(
+                    static_cast<IPCCommand>(command.buffer[4]))) {
+                if (ret.size < 4 + 1 + 4) {
+                    SetError(Fail);
+                    return;
+                }
+                reloc_add += FromArray<uint32_t>(ret.buffer, 5);
+            }
+        }
+
+        if (reply_size + reloc_add > ret.size) {
+            SetError(Fail);
+            return;
         }
     }
 
@@ -789,20 +838,30 @@ class Shared {
         // we copy our arrays to unblock the IPC class.
         int bl = batch_len;
         int rl = needs_reloc ? MAX_IPC_RETURN_SIZE : reply_len;
+        unsigned int expected_reply_size = reply_len;
+        bool reloc = needs_reloc;
+        unsigned int arg_count = arg_cnt;
+
         char *c_cmd = new char[batch_len];
         memcpy(c_cmd, ipc_buffer, batch_len * sizeof(char));
+
         char *c_ret = new char[rl];
         memcpy(c_ret, ret_buffer, rl * sizeof(char));
-        unsigned int *arg_place = new unsigned int[arg_cnt];
-        memcpy(arg_place, batch_arg_place, arg_cnt * sizeof(unsigned int));
+
+        unsigned int *arg_place = new unsigned int[arg_count];
+        memcpy(arg_place, batch_arg_place, arg_count * sizeof(unsigned int));
 
         // we unblock the mutex
         batch_blocking.unlock();
         ipc_blocking.unlock();
 
         // MultiCommand is done!
-        return BatchCommand{ IPCBuffer{ bl, c_cmd }, IPCBuffer{ rl, c_ret },
-                             arg_place, arg_cnt, needs_reloc };
+        return BatchCommand{ IPCBuffer{ bl, c_cmd },
+                             IPCBuffer{ rl, c_ret },
+                             arg_place,
+                             arg_count,
+                             expected_reply_size,
+                             reloc };
     }
 
     /**
@@ -864,7 +923,7 @@ class Shared {
                 IPCBuffer{ 4 + 5,
                            FormatBeginning(ipc_buffer, address, tag, 4 + 5) };
             IPCBuffer ret = IPCBuffer{ 1 + sizeof(Y) + 4, ret_buffer };
-            SendCommand(cmd, ret);
+            SendCommand(cmd, ret, ret.size);
             return GetReply<tag>(ret_buffer, 5);
         }
     }
@@ -924,7 +983,9 @@ class Shared {
             int size = 4 + 5 + sizeof(Y);
             char *cmd = ToArray(FormatBeginning(ipc_buffer, address, tag, size),
                                 value, 4 + 5);
-            SendCommand(IPCBuffer{ size, cmd }, IPCBuffer{ 1 + 4, ret_buffer });
+            const int reply_size = 4 + 1;
+            SendCommand(IPCBuffer{ size, cmd },
+                        IPCBuffer{ reply_size, ret_buffer }, reply_size);
             return;
         }
     }
@@ -984,8 +1045,9 @@ class Shared {
             std::lock_guard<std::mutex> lock(ipc_blocking);
             ToArray(ipc_buffer, 4 + 1, 0);
             ipc_buffer[4] = tag;
+            const int reply_size = 4 + 1 + 4;
             SendCommand(IPCBuffer{ 4 + 1, ipc_buffer },
-                        IPCBuffer{ 4 + 1 + 4, ret_buffer });
+                        IPCBuffer{ reply_size, ret_buffer }, reply_size);
             return GetReply<tag>(ret_buffer, 5);
         }
     }
@@ -1231,5 +1293,4 @@ class DuckStation : public Shared {
         return;
     }
 };
-
 }; // namespace PINE
